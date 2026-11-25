@@ -1,0 +1,73 @@
+name: Verify anonymous public walk pack downloads
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/verify-download.yml']
+  workflow_dispatch:
+  release:
+    types: [published]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        region: [seoul,incheon,gyeonggi,gangwon,chungcheong,jeolla,gyeongsang,jeju]
+    steps:
+      - name: Download without authentication and verify Android pack contract
+        env:
+          REGION: ${{ matrix.region }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, sqlite3, tempfile, urllib.request, urllib.parse, zipfile
+          region = os.environ['REGION']
+          origin = 'https://github.com/ptrickseo/BUSNARU-map-data/releases/download/walk-v1/BUSNARU-walk-' + region + '.zip'
+          source = 'https://tiles.osm.kr/download/' + region + '-non-military.osm.pbf'
+          def allowed(url):
+              u = urllib.parse.urlsplit(url)
+              return u.scheme == 'https' and not u.username and not u.password and u.port is None and (url == origin or u.hostname in ('release-assets.githubusercontent.com', 'objects.githubusercontent.com'))
+          class Redirect(urllib.request.HTTPRedirectHandler):
+              max_redirections = 4
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  if not allowed(newurl):
+                      raise ValueError('unexpected redirect host')
+                  return super().redirect_request(req, fp, code, msg, headers, newurl)
+          opener = urllib.request.build_opener(Redirect())
+          with tempfile.TemporaryDirectory() as tmp:
+              p = pathlib.Path(tmp)
+              archive = p / 'pack.zip'
+              with opener.open(urllib.request.Request(origin, headers={'User-Agent':'BUSNARU/0.9','Accept':'application/octet-stream'}), timeout=60) as r, archive.open('wb') as f:
+                  assert r.status == 200 and allowed(r.geturl())
+                  expected = r.headers.get('Content-Length')
+                  n = 0
+                  while chunk := r.read(65536):
+                      n += len(chunk)
+                      assert n <= 500_000_000
+                      f.write(chunk)
+                  assert n > 0 and (expected is None or n == int(expected))
+              with zipfile.ZipFile(archive) as z:
+                  assert z.namelist() == ['manifest.json','walk.sqlite','LICENSE-NOTICE.txt']
+                  assert z.getinfo('manifest.json').file_size <= 65536
+                  m = json.loads(z.read('manifest.json'))
+                  assert m['region'] == region and m['schema'] == 1 and m['license'] == 'ODbL 1.0' and m['source'] == source
+                  assert 0 < m['size'] <= 1_500_000_000 and z.getinfo('walk.sqlite').file_size == m['size']
+                  assert z.getinfo('LICENSE-NOTICE.txt').file_size <= 65536 and b'OpenStreetMap' in z.read('LICENSE-NOTICE.txt')
+                  dbpath = p / 'walk.sqlite'
+                  with z.open('walk.sqlite') as src, dbpath.open('wb') as dst:
+                      shutil.copyfileobj(src,dst)
+                  with dbpath.open('rb') as f:
+                      assert hashlib.file_digest(f,'sha256').hexdigest() == m['sha256']
+                  assert dbpath.stat().st_size == m['size']
+                  with sqlite3.connect(dbpath.as_uri()+'?mode=ro',uri=True) as db:
+                      assert db.execute('PRAGMA quick_check(1)').fetchone() == ('ok',)
+                      meta = {k:json.loads(v) for k,v in db.execute('SELECT k,v FROM meta')}
+                      assert meta['source'] == source and meta['license'] == 'ODbL 1.0' and meta['schema'] == 1
+                      assert meta['sha256'] == m['source_sha256']
+                      counts = {t:db.execute('SELECT COUNT(*) FROM '+t).fetchone()[0] for t in ('nodes','edges','places')}
+                      assert counts == m['counts'] and counts['nodes'] > 1000 and counts['edges'] > 1000 and counts['places'] > 10
+                  print(json.dumps({'region':region,'download_bytes':n,'sqlite_bytes':m['size'],'sha256':m['sha256'],'counts':counts,'result':'PASS','device_verified':False}))
+          PY
