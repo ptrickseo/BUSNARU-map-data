@@ -1,0 +1,63 @@
+name: Build and publish public ODbL walk packs
+on:
+  push:
+    branches: [main]
+    paths: ['scripts/**','.github/workflows/publish.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  regional:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        region: [seoul,incheon,gyeonggi,gangwon,chungcheong,jeolla,gyeongsang,jeju]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build verified regional database
+        env:
+          REGION: ${{ matrix.region }}
+        run: |
+          python -m pip install --quiet osmium
+          URL="https://tiles.osm.kr/download/${REGION}-non-military.osm.pbf"
+          curl --fail --location --retry 2 --max-time 240 "$URL" -o /tmp/region.osm.pbf
+          python scripts/build_osm_walk.py /tmp/region.osm.pbf /tmp/region.sqlite --source-url "$URL"
+          python scripts/package_region.py "$REGION" /tmp/region.sqlite "BUSNARU-walk-${REGION}.zip"
+          PYTHONPATH=scripts python - <<'PY'
+          from build_osm_walk import connect,route
+          db=connect('/tmp/region.sqlite')
+          x,y=db.execute('SELECT src,dst FROM edges WHERE meters BETWEEN 50 AND 150 LIMIT 1').fetchone()
+          r=route('/tmp/region.sqlite',x,y)
+          assert r['status']=='OK' and 0<r['meters']<=150
+          print('Mapped pedestrian route verified:',r['meters'],'m')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: walk-${{ matrix.region }}
+          path: BUSNARU-walk-${{ matrix.region }}.zip
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: regional
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: walk-*
+          path: packs
+          merge-multiple: true
+      - name: Publish only ODbL regional ZIP assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          test "$GH_REPO" = "ptrickseo/BUSNARU-map-data"
+          test "$(find packs -name 'BUSNARU-walk-*.zip' | wc -l)" -eq 8
+          gh release create walk-v1 packs/BUSNARU-walk-*.zip --title "BUSNARU offline walking data v1" --notes "© OpenStreetMap contributors, ODbL 1.0. Regional mapped walking graphs. Source and license metadata included. No guarantee of field-verified routes." --target "$GITHUB_SHA"
